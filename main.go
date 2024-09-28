@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -10,112 +11,179 @@ import (
 	"time"
 )
 
-type pair struct {
+const workerPoolSize = 16
+
+type fileHashPair struct {
 	hash     string
 	filePath string
 }
 
-func processFile(filePath string, pairs map[string][]string, ch chan<- pair, wg *sync.WaitGroup) {
-	defer wg.Done()
-	file, err := os.Open(filePath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+func main() {
+	startTime := time.Now()
+	defer func() {
+		elapsed := time.Since(startTime)
+		fmt.Printf("Time taken: %.2fs\n", elapsed.Seconds())
+	}()
 
-	fileContents, err := io.ReadAll(file)
-	if err != nil {
-		return
-	}
-
-	//skip empty files and files with size more than 1Mb
-	if len(fileContents) == 0 || len(fileContents) > 1024*1024 {
-		return
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: program <directory_path>")
+		os.Exit(1)
 	}
 
-	md5Hash := md5.New()
-	md5Hash.Write(fileContents)
-	md5HashString := fmt.Sprintf("%x", md5Hash.Sum(nil))
-	shortmd5HashString := md5HashString[:8]
+	directoryPath := os.Args[1]
+	filePathsByHash := make(map[string][]string)
 
-	pair := pair{
-		hash:     shortmd5HashString,
-		filePath: filePath,
+	if err := walkDirectory(directoryPath, filePathsByHash); err != nil {
+		fmt.Printf("Error walking directory: %v\n", err)
 	}
 
-	ch <- pair
+	writeDuplicateFiles(filePathsByHash)
 }
 
-func walk(path string, pairs map[string][]string) error {
-	ch := make(chan pair)
-	defer close(ch)
+func walkDirectory(path string, pairs map[string][]string) error {
+	var workerWg sync.WaitGroup
+	fileHashCh := make(chan fileHashPair)
+	done := make(chan struct{})
+	filesProcessed := 0
 
-	//instantiate a waitgroup to wait for all goroutines to finish using the keyword new
-	wg := new(sync.WaitGroup)
+	// Start the collector goroutine
 
-	go collectPairs(pairs, ch, wg)
+	go func() {
+		collectFileHashes(pairs, fileHashCh, &filesProcessed)
+		close(done)
+	}()
 
+	filePathCh := make(chan string, workerPoolSize)
+
+	// Start worker goroutines
+	for i := 0; i < workerPoolSize; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			processFiles(filePathCh, fileHashCh)
+		}()
+	}
+
+	// Walk through the directory and send file paths to filePathCh
 	err := filepath.WalkDir(path, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			fmt.Printf("%v", err)
-		}
-
-		if d.IsDir() {
 			return nil
 		}
-
-		wg.Add(1)
-		go processFile(path, pairs, ch, wg)
-
+		if !d.IsDir() {
+			filePathCh <- path
+		}
 		return nil
 	})
+	close(filePathCh)
 
-	wg.Wait()
+	// Wait for all workers to complete
+	workerWg.Wait()
+	close(fileHashCh)
+
+	// Wait for collector to finish processing
+	<-done
+
 	return err
 }
 
-func collectPairs(pairs map[string][]string, ch chan pair, wg *sync.WaitGroup) {
-	// wait for a goroutine to send a pair
-	for pair := range ch {
-		pairs[pair.hash] = append(pairs[pair.hash], pair.filePath)
+func processFiles(filePathCh <-chan string, fileHashCh chan<- fileHashPair) {
+	for filePath := range filePathCh {
+		processSingleFile(filePath, fileHashCh)
+	}
+}
 
-		if len(pairs) != 0 && len(pairs)%100 == 0 {
-			fmt.Printf("Processed approximately %d files\n", len(pairs))
+func processSingleFile(filePath string, fileHashCh chan<- fileHashPair) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Printf("Failed to open file %s: %v\n", filePath, err)
+
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		fmt.Printf("Failed to stat file %s: %v\n", filePath, err)
+		return
+	}
+
+	// Skip empty files and files larger than 1MB
+	if fileInfo.Size() == 0 || fileInfo.Size() > 1*1024*1024 {
+		return
+	}
+
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return
+	}
+
+	hash := fmt.Sprintf("%x", hasher.Sum(nil))[:8]
+	fileHashCh <- fileHashPair{hash: hash, filePath: filePath}
+}
+
+func collectFileHashes(pairs map[string][]string, fileHashCh <-chan fileHashPair, filesProcessed *int) {
+	for pair := range fileHashCh {
+		*filesProcessed++
+		pairs[pair.hash] = append(pairs[pair.hash], pair.filePath)
+		if len(pairs)%10000 == 0 {
+			fmt.Printf("Processed approximately %d unique hashes\n", len(pairs))
 		}
 	}
-
-	fmt.Printf("Processed all channels")
+	fmt.Printf("Processed %d files\n", *filesProcessed)
 }
 
-func trackTime(start time.Time) {
-	elapsed := time.Since(start)
-	// print time taken in seconds rounded to 2 decimal places
-	fmt.Printf("Time taken: %.2fs\n", elapsed.Seconds())
+type DuplicateEntry struct {
+	Hash      string   `json:"hash"`
+	FilePaths []string `json:"filePaths"`
 }
 
-func main() {
-	defer trackTime(time.Now())
-	directoryPathArgs := os.Args[1:]
-
-	if len(directoryPathArgs) == 0 {
-		fmt.Printf("No filepath provided. Exiting gracefully\n")
-		os.Exit(0)
-	}
-
-	directoryPath := directoryPathArgs[0]
-	filePathsByHash := make(map[string][]string)
-
-	err := walk(directoryPath, filePathsByHash)
+func writeDuplicateFiles(filePathsByHash map[string][]string) error {
+	file, err := os.Create("duplicateFiles.json")
 	if err != nil {
-		fmt.Printf("Error walking directory: %v", err)
+		return fmt.Errorf("error while creating file: %v", err)
+	}
+	defer file.Close()
+
+	// Start the JSON array
+	_, err = file.Write([]byte("[\n"))
+	if err != nil {
+		return fmt.Errorf("error writing to file: %v", err)
 	}
 
+	first := true
 	for hash, filePaths := range filePathsByHash {
 		if len(filePaths) > 1 {
-			fmt.Printf("Duplicate files found for hash: %s\n", hash)
-			for _, filePath := range filePaths {
-				fmt.Printf("File: %s\n", filePath)
+			if !first {
+				_, err = file.Write([]byte(",\n"))
+				if err != nil {
+					return fmt.Errorf("error writing to file: %v", err)
+				}
+			} else {
+				first = false
+			}
+
+			entry := DuplicateEntry{
+				Hash:      hash,
+				FilePaths: filePaths,
+			}
+
+			// Encode the entry without adding a newline
+			entryBytes, err := json.Marshal(entry)
+			if err != nil {
+				return fmt.Errorf("error marshalling entry: %v", err)
+			}
+
+			_, err = file.Write(entryBytes)
+			if err != nil {
+				return fmt.Errorf("error writing entry to file: %v", err)
 			}
 		}
 	}
+
+	// End the JSON array
+	_, err = file.Write([]byte("\n]\n"))
+	if err != nil {
+		return fmt.Errorf("error writing to file: %v", err)
+	}
+
+	return nil
 }
