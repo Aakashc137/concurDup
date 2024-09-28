@@ -6,41 +6,55 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-func processFile(filePath string, pairs map[string][]string) error {
+type pair struct {
+	hash     string
+	filePath string
+}
+
+func processFile(filePath string, pairs map[string][]string, ch chan<- pair, wg *sync.WaitGroup) {
+	defer wg.Done()
 	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return
 	}
 	defer file.Close()
 
 	fileContents, err := io.ReadAll(file)
 	if err != nil {
-		return err
+		return
 	}
 
-	//skip empty files and files with size more than 500Mb
-	if len(fileContents) == 0 || len(fileContents) > 500*1024*1024 {
-		return nil
+	//skip empty files and files with size more than 1Mb
+	if len(fileContents) == 0 || len(fileContents) > 1024*1024 {
+		return
 	}
 
 	md5Hash := md5.New()
 	md5Hash.Write(fileContents)
-
 	md5HashString := fmt.Sprintf("%x", md5Hash.Sum(nil))
 	shortmd5HashString := md5HashString[:8]
-	pairs[shortmd5HashString] = append(pairs[shortmd5HashString], filePath)
 
-	if len(pairs) != 0 && len(pairs)%100 == 0 {
-		fmt.Printf("Processed approximately %d|%d files\n", len(pairs), count)
+	pair := pair{
+		hash:     shortmd5HashString,
+		filePath: filePath,
 	}
 
-	return nil
+	ch <- pair
 }
 
 func walk(path string, pairs map[string][]string) error {
+	ch := make(chan pair)
+	defer close(ch)
+
+	//instantiate a waitgroup to wait for all goroutines to finish using the keyword new
+	wg := new(sync.WaitGroup)
+
+	go collectPairs(pairs, ch, wg)
+
 	err := filepath.WalkDir(path, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			fmt.Printf("%v", err)
@@ -50,16 +64,27 @@ func walk(path string, pairs map[string][]string) error {
 			return nil
 		}
 
-		err = processFile(path, pairs)
-		if err != nil {
-			// We are not checking for errors, If we encounter an error, we will just skip the file
-			return nil
-		}
+		wg.Add(1)
+		go processFile(path, pairs, ch, wg)
 
 		return nil
 	})
 
+	wg.Wait()
 	return err
+}
+
+func collectPairs(pairs map[string][]string, ch chan pair, wg *sync.WaitGroup) {
+	// wait for a goroutine to send a pair
+	for pair := range ch {
+		pairs[pair.hash] = append(pairs[pair.hash], pair.filePath)
+
+		if len(pairs) != 0 && len(pairs)%100 == 0 {
+			fmt.Printf("Processed approximately %d files\n", len(pairs))
+		}
+	}
+
+	fmt.Printf("Processed all channels")
 }
 
 func trackTime(start time.Time) {
